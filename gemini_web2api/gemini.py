@@ -106,7 +106,9 @@ def _get_socks_opener():
                     def connect(self):
                         proxy_type, host, port, user, password, rdns = _parse_socks_proxy(
                             _resolve_proxy(CONFIG.get("proxy")))
-                        sock = socks.socksocket()
+                        # AF_UNSPEC: the proxy host may resolve to IPv6 only
+                        # (default AF_INET would fail with errno -9).
+                        sock = socks.socksocket(socket.AF_UNSPEC, socket.SOCK_STREAM)
                         sock.set_proxy(proxy_type, host, port, rdns=rdns, username=user, password=password)
                         if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
                             sock.settimeout(self.timeout)
