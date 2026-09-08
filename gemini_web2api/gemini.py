@@ -89,6 +89,33 @@ def _parse_socks_proxy(proxy: str) -> tuple:
     return proxy_type, parsed.hostname, parsed.port or 1080, parsed.username, parsed.password, scheme == "socks5h"
 
 
+def _socks_dial(proxy_type, proxy_host, proxy_port, user, password, rdns, dest, timeout):
+    """Dial `dest` through a SOCKS proxy, trying IPv4 then IPv6.
+
+    PySocks resolves the proxy hostname within the socket's address family:
+    AF_INET fails with getaddrinfo errno -9 on IPv6-only proxy hosts, and
+    AF_INET6 fails with errno 97 on hosts without kernel IPv6 support.
+    Trying both families covers dual-stack, IPv4-only, and IPv6-only setups.
+    """
+    last_err = None
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            sock = socks.socksocket(family, socket.SOCK_STREAM)
+        except OSError as e:  # family not supported by this host
+            last_err = e
+            continue
+        sock.set_proxy(proxy_type, proxy_host, proxy_port, rdns=rdns, username=user, password=password)
+        if timeout is not None:
+            sock.settimeout(timeout)
+        try:
+            sock.connect(dest)
+            return sock
+        except OSError as e:
+            last_err = e
+            sock.close()
+    raise last_err
+
+
 def _get_socks_opener():
     """Build (once) a urllib opener that tunnels HTTPS through a SOCKS proxy.
 
@@ -106,13 +133,10 @@ def _get_socks_opener():
                     def connect(self):
                         proxy_type, host, port, user, password, rdns = _parse_socks_proxy(
                             _resolve_proxy(CONFIG.get("proxy")))
-                        # AF_UNSPEC: the proxy host may resolve to IPv6 only
-                        # (default AF_INET would fail with errno -9).
-                        sock = socks.socksocket(socket.AF_UNSPEC, socket.SOCK_STREAM)
-                        sock.set_proxy(proxy_type, host, port, rdns=rdns, username=user, password=password)
-                        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-                            sock.settimeout(self.timeout)
-                        sock.connect((self.host, self.port))
+                        timeout = None if self.timeout is socket._GLOBAL_DEFAULT_TIMEOUT else self.timeout
+                        sock = _socks_dial(
+                            proxy_type, host, port, user, password, rdns,
+                            (self.host, self.port), timeout)
                         # Must wrap in TLS ourselves: overriding connect() bypasses
                         # HTTPSConnection's built-in wrap_socket step.
                         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
