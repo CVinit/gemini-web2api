@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--cookie-file", type=str, default=None)
-    parser.add_argument("--proxy", type=str, default=None, help="HTTP proxy, e.g. http://127.0.0.1:7890")
+    parser.add_argument("--proxy", type=str, default=None, help="Proxy URL, e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080")
     parser.add_argument("--version", action="version", version=f"gemini-web2api {__version__}")
     args = parser.parse_args()
 

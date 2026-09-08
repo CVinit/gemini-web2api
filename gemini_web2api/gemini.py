@@ -1,5 +1,10 @@
 """Gemini StreamGenerate protocol implementation with httpx streaming."""
+import http.client
 import json
+import secrets
+import socket
+import string
+import threading
 import time
 import uuid
 import re
@@ -15,11 +20,26 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
+try:
+    import socks  # PySocks, only needed for socks5:// proxies on the urllib path
+    HAS_PYSOCKS = True
+except ImportError:
+    HAS_PYSOCKS = False
+
 from .config import CONFIG
 
+
+class UpstreamRejected(RuntimeError):
+    """Gemini upstream rejected the request; retrying the same payload is pointless."""
+
+
 _ssl_ctx = None
+_ssl_lock = threading.Lock()
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+_httpx_lock = threading.Lock()
+_socks_opener = None
+_socks_opener_lock = threading.Lock()
 
 
 def log(msg: str):
@@ -32,16 +52,94 @@ def log(msg: str):
 def _get_ssl_ctx():
     global _ssl_ctx
     if _ssl_ctx is None:
-        _ssl_ctx = ssl.create_default_context()
+        with _ssl_lock:
+            if _ssl_ctx is None:
+                _ssl_ctx = ssl.create_default_context()
     return _ssl_ctx
 
 
+def _is_socks_proxy(proxy: str) -> bool:
+    return bool(proxy) and proxy.lower().startswith(("socks4://", "socks5://", "socks5h://"))
+
+
+_RANDOM_TOKEN = "{random}"
+
+
+def _random_label(length: int = 12) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _resolve_proxy(proxy: str) -> str:
+    """Expand the {random} placeholder in a proxy URL per request.
+
+    e.g. socks5h://homenet.{random}:<token>@resin.555576.xyz becomes a unique
+    username on every call, giving each request its own routing session.
+    """
+    if not proxy or _RANDOM_TOKEN not in proxy:
+        return proxy
+    return proxy.replace(_RANDOM_TOKEN, _random_label())
+
+
+def _parse_socks_proxy(proxy: str) -> tuple:
+    """Parse socks5://[user:pass@]host:port into (proxy_type, host, port, user, pass, rdns)."""
+    parsed = urllib.parse.urlparse(proxy)
+    scheme = parsed.scheme.lower()
+    proxy_type = socks.PROXY_TYPE_SOCKS4 if scheme == "socks4" else socks.PROXY_TYPE_SOCKS5
+    return proxy_type, parsed.hostname, parsed.port or 1080, parsed.username, parsed.password, scheme == "socks5h"
+
+
+def _get_socks_opener():
+    """Build (once) a urllib opener that tunnels HTTPS through a SOCKS proxy.
+
+    Proxy credentials are resolved inside connect() per connection, so a
+    {random} placeholder in the proxy URL rotates per request.
+    """
+    global _socks_opener
+    if _socks_opener is None:
+        with _socks_opener_lock:
+            if _socks_opener is None:
+                if not HAS_PYSOCKS:
+                    raise RuntimeError("SOCKS proxy requires PySocks: pip install pysocks")
+
+                class SocksHTTPSConnection(http.client.HTTPSConnection):
+                    def connect(self):
+                        proxy_type, host, port, user, password, rdns = _parse_socks_proxy(
+                            _resolve_proxy(CONFIG.get("proxy")))
+                        sock = socks.socksocket()
+                        sock.set_proxy(proxy_type, host, port, rdns=rdns, username=user, password=password)
+                        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                            sock.settimeout(self.timeout)
+                        sock.connect((self.host, self.port))
+                        # Must wrap in TLS ourselves: overriding connect() bypasses
+                        # HTTPSConnection's built-in wrap_socket step.
+                        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+                class SocksHTTPSHandler(urllib.request.HTTPSHandler):
+                    def https_open(self, req):
+                        return self.do_open(SocksHTTPSConnection, req, context=self._context)
+
+                # Empty ProxyHandler: ignore env HTTP_PROXY/HTTPS_PROXY, all traffic goes via SOCKS.
+                _socks_opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}), SocksHTTPSHandler(context=_get_ssl_ctx())
+                )
+    return _socks_opener
+
+
+
 def _get_httpx_client():
+    """Return a shared httpx client, or per-request ones if the proxy URL
+    contains a {random} placeholder (credentials must rotate per request)."""
+    if HAS_HTTPX and _RANDOM_TOKEN in (CONFIG.get("proxy") or ""):
+        proxy = _resolve_proxy(CONFIG.get("proxy"))
+        return httpx.Client(proxy=proxy, timeout=CONFIG["request_timeout_sec"], verify=True)
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
-        proxy = CONFIG.get("proxy")
-        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        with _httpx_lock:
+            if _httpx_client is None:
+                proxy = CONFIG.get("proxy")
+                transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+                _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
     return _httpx_client
 
 
@@ -50,6 +148,9 @@ def load_cookie() -> tuple:
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
+    # Cookie file is hot-reloaded on mtime change; concurrent requests may race
+    # on the read, but dict reads of str values are atomic enough in CPython and
+    # a torn read at worst returns the previous cookie for one request.
     try:
         mtime = os.path.getmtime(cookie_file)
         if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
@@ -193,7 +294,7 @@ def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+        raise UpstreamRejected(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -210,15 +311,22 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
+    if proxy and not _is_socks_proxy(proxy):
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+    else:
+        # Direct, or SOCKS proxy (which needs its own opener built lazily).
+        opener = None
+
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
+            if _is_socks_proxy(proxy):
+                resp = _get_socks_opener().open(req, timeout=CONFIG["request_timeout_sec"])
+            elif opener is not None:
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
@@ -257,7 +365,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     if "BardErrorInfo" in buf:
                         bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if bard_err:
-                            raise RuntimeError(
+                            raise UpstreamRejected(
                                 f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
                             )
                     while "\n" in buf:
@@ -266,12 +374,16 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
                             if not t.startswith(emitted_raw_text):
-                                raise RuntimeError("Gemini stream content changed during retry")
+                                raise UpstreamRejected("Gemini stream content changed during retry")
                             delta = clean_text(t[len(emitted_raw_text):], strip=False)
                             emitted_raw_text = t
                             if delta:
                                 yield delta
             return
+        except UpstreamRejected:
+            # Gemini rejected the request itself (BardErrorInfo); a retry with
+            # the same payload cannot succeed.
+            raise
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:

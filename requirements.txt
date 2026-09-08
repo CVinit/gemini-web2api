@@ -1,1 +1,2 @@
-httpx>=0.25
+httpx[socks]>=0.25
+pysocks>=1.7  # only needed for socks5:// proxies on the urllib path

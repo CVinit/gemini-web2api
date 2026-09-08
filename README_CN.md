@@ -213,12 +213,12 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 **方式 1: 命令行参数**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python gemini_web2api.py --proxy socks5://127.0.0.1:1080
 ```
 
 **方式 2: config.json**
 ```json
-{"proxy": "http://127.0.0.1:7890"}
+{"proxy": "socks5://127.0.0.1:1080"}
 ```
 
 **方式 3: 环境变量** (自动检测)
@@ -227,7 +227,18 @@ set HTTPS_PROXY=http://127.0.0.1:7890
 python gemini_web2api.py
 ```
 
-支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
+支持 Clash, V2Ray, Shadowsocks 等任何 HTTP / SOCKS4 / SOCKS5 代理.
+SOCKS 代理 (`socks5://`, `socks5h://`, `socks4://`) 需要安装 PySocks (`pip install pysocks`);
+`socks5h://` 表示由代理端解析 DNS, 适用于本地无法解析目标域名的场景.
+
+**动态用户名**: 代理 URL 中可使用 `{random}` 占位符, 每次请求都会生成一个随机
+字母数字组合替换该占位符 — 例如 Resin 风格的会话路由:
+
+```json
+{"proxy": "socks5h://homenet.{random}:<token>@resin.555576.xyz"}
+```
+
+每个请求都会以形如 `homenet.k5vgvtncdi8e` 的唯一用户名建立连接.
 
 ## 图片输入
 

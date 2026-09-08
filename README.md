@@ -224,12 +224,12 @@ If you cannot access `gemini.google.com` directly (connection timeout), configur
 
 **Method 1: CLI argument**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python gemini_web2api.py --proxy socks5://127.0.0.1:1080
 ```
 
 **Method 2: config.json**
 ```json
-{"proxy": "http://127.0.0.1:7890"}
+{"proxy": "socks5://127.0.0.1:1080"}
 ```
 
 **Method 3: Environment variable** (auto-detected)
@@ -238,7 +238,18 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 python gemini_web2api.py
 ```
 
-Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
+Works with Clash, V2Ray, Shadowsocks, or any HTTP / SOCKS4 / SOCKS5 proxy.
+SOCKS proxies (`socks5://`, `socks5h://`, `socks4://`) require PySocks (`pip install pysocks`);
+`socks5h://` resolves DNS on the proxy side, which is useful if the target host is blocked locally.
+
+**Rotating username**: use `{random}` in the proxy URL to generate a fresh random
+alphanumeric label for every request — e.g. Resin-style session routing:
+
+```json
+{"proxy": "socks5h://homenet.{random}:<token>@resin.555576.xyz"}
+```
+
+Each request connects with a unique username like `homenet.k5vgvtncdi8e`.
 
 ## Tool Calling
 

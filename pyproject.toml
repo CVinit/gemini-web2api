@@ -8,7 +8,8 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]
-streaming = ["httpx>=0.25"]
+streaming = ["httpx[socks]>=0.25"]
+socks = ["pysocks>=1.7"]
 
 [project.scripts]
 gemini-web2api = "gemini_web2api.__main__:main"
