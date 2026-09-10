@@ -157,11 +157,11 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "host": "0.0.0.0",
   "retry_attempts": 3,
   "retry_delay_sec": 2,
-  "request_timeout_sec": 180,
-  "max_inflight_requests": 64,
-  "max_waiting_requests": 192,
-  "inflight_acquire_timeout_sec": 45.0,
-  "max_concurrent_connections": 320,
+  "request_timeout_sec": 90,
+  "max_inflight_requests": 32,
+  "max_waiting_requests": 64,
+  "inflight_acquire_timeout_sec": 15.0,
+  "max_concurrent_connections": 160,
   "http_listen_backlog": 128,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
@@ -181,18 +181,22 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 ### 高并发（无 Cookie + IP 池）
 
-适用于匿名 Flash 模型、代理 `{random}` 每请求换 IP 的部署：
+适用于匿名 Flash 模型、代理 `{random}` 每请求换 IP 的部署。当前默认为
+压测后的**稳态档**：限制 inflight，避免上游挂起占满槽位；排队超时短于
+客户端常见超时，尽早返回 503。
 
 | 配置 | 含义 | 默认 |
 |------|------|------|
-| `max_inflight_requests` | 同时进行的上游生成数 | 64 |
-| `max_waiting_requests` | 可排队等待槽位的请求数 | 192 |
-| `inflight_acquire_timeout_sec` | 排队最长等待秒数，超时返回 503 | 45 |
-| `max_concurrent_connections` | 同时处理的连接/线程上限 | 320 |
+| `max_inflight_requests` | 同时进行的上游生成数 | 32 |
+| `max_waiting_requests` | 可排队等待槽位的请求数 | 64 |
+| `inflight_acquire_timeout_sec` | 排队最长等待秒数，超时返回 503 | 15 |
+| `max_concurrent_connections` | 同时处理的连接/线程上限 | 160 |
 | `http_listen_backlog` | listen 队列深度 | 128 |
+| `request_timeout_sec` | 上游请求超时（秒） | 90 |
 
 `GET /metrics` 返回当前 `inflight` / `waiting` / `connections`，便于压测与扩容。
 单 Cookie 会话场景请把 `max_inflight_requests` 调回 2–4，避免同会话并发被上游拒绝。
+IP 池质量好、且上游很少挂起时，可再把 `max_inflight_requests` 提到 48–64。
 
 ### 上下文缓存
 
