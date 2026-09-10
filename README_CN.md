@@ -158,6 +158,11 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "max_inflight_requests": 64,
+  "max_waiting_requests": 192,
+  "inflight_acquire_timeout_sec": 45.0,
+  "max_concurrent_connections": 320,
+  "http_listen_backlog": 128,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -173,6 +178,21 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 不会将对话保存在账号历史记录中。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+
+### 高并发（无 Cookie + IP 池）
+
+适用于匿名 Flash 模型、代理 `{random}` 每请求换 IP 的部署：
+
+| 配置 | 含义 | 默认 |
+|------|------|------|
+| `max_inflight_requests` | 同时进行的上游生成数 | 64 |
+| `max_waiting_requests` | 可排队等待槽位的请求数 | 192 |
+| `inflight_acquire_timeout_sec` | 排队最长等待秒数，超时返回 503 | 45 |
+| `max_concurrent_connections` | 同时处理的连接/线程上限 | 320 |
+| `http_listen_backlog` | listen 队列深度 | 128 |
+
+`GET /metrics` 返回当前 `inflight` / `waiting` / `connections`，便于压测与扩容。
+单 Cookie 会话场景请把 `max_inflight_requests` 调回 2–4，避免同会话并发被上游拒绝。
 
 ### 上下文缓存
 

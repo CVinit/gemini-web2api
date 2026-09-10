@@ -13,6 +13,8 @@ import urllib.parse
 import ssl
 import os
 import hashlib
+import random
+from urllib.error import HTTPError
 
 try:
     import httpx
@@ -40,6 +42,9 @@ _httpx_client = None
 _httpx_lock = threading.Lock()
 _socks_opener = None
 _socks_opener_lock = threading.Lock()
+_http_proxy_opener = None
+_http_proxy_opener_key = None
+_http_proxy_opener_lock = threading.Lock()
 
 
 def log(msg: str):
@@ -79,6 +84,23 @@ def _resolve_proxy(proxy: str) -> str:
     if not proxy or _RANDOM_TOKEN not in proxy:
         return proxy
     return proxy.replace(_RANDOM_TOKEN, _random_label())
+
+
+def _retryable(error: Exception) -> bool:
+    if isinstance(error, UpstreamRejected):
+        return False
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(error, HTTPError):
+        status = error.code
+    return not (status is not None and 400 <= status < 500 and status != 429)
+
+
+def _retry_delay(attempt: int) -> float:
+    base = max(0.0, float(CONFIG.get("retry_delay_sec", 2)))
+    return min(30.0, base * (2 ** attempt)) * random.uniform(0.8, 1.2)
+
+
 
 
 def _parse_socks_proxy(proxy: str) -> tuple:
@@ -153,20 +175,56 @@ def _get_socks_opener():
 
 
 
+def _httpx_limits():
+    max_inflight = max(1, int(CONFIG.get("max_inflight_requests", 64)))
+    return httpx.Limits(
+        max_connections=max(32, max_inflight * 2),
+        max_keepalive_connections=max(8, max_inflight // 2),
+        keepalive_expiry=30.0,
+    )
+
+
 def _get_httpx_client():
     """Return a shared httpx client, or per-request ones if the proxy URL
     contains a {random} placeholder (credentials must rotate per request)."""
     if HAS_HTTPX and _RANDOM_TOKEN in (CONFIG.get("proxy") or ""):
         proxy = _resolve_proxy(CONFIG.get("proxy"))
-        return httpx.Client(proxy=proxy, timeout=CONFIG["request_timeout_sec"], verify=True)
+        # Unique exit IP per request: keepalive cannot be shared across proxies.
+        return httpx.Client(
+            proxy=proxy,
+            timeout=CONFIG["request_timeout_sec"],
+            verify=True,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+        )
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
         with _httpx_lock:
             if _httpx_client is None:
                 proxy = CONFIG.get("proxy")
-                transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-                _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+                transport = httpx.HTTPTransport(proxy=proxy, limits=_httpx_limits()) if proxy else httpx.HTTPTransport(limits=_httpx_limits())
+                _httpx_client = httpx.Client(
+                    transport=transport,
+                    timeout=CONFIG["request_timeout_sec"],
+                    verify=True,
+                    limits=_httpx_limits(),
+                )
     return _httpx_client
+
+
+def _get_http_proxy_opener(proxy: str):
+    """Reuse a urllib opener for a stable (non-{random}) HTTP proxy."""
+    global _http_proxy_opener, _http_proxy_opener_key
+    key = proxy
+    if _http_proxy_opener is not None and _http_proxy_opener_key == key:
+        return _http_proxy_opener
+    with _http_proxy_opener_lock:
+        if _http_proxy_opener is None or _http_proxy_opener_key != key:
+            _http_proxy_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=_get_ssl_ctx())
+            )
+            _http_proxy_opener_key = key
+    return _http_proxy_opener
 
 
 def load_cookie() -> tuple:
@@ -338,10 +396,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     proxy = CONFIG.get("proxy")
 
     if proxy and not _is_socks_proxy(proxy):
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-            urllib.request.HTTPSHandler(context=ctx)
-        )
+        # Stable proxy: reuse opener. {random} rotates credentials per request.
+        if _RANDOM_TOKEN in proxy:
+            proxy = _resolve_proxy(proxy)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=_get_ssl_ctx())
+            )
+        else:
+            opener = _get_http_proxy_opener(proxy)
     else:
         # Direct, or SOCKS proxy (which needs its own opener built lazily).
         opener = None
@@ -356,13 +419,25 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
+            with resp:
+                chunks = []
+                total = 0
+                limit = max(1, int(CONFIG.get("max_upstream_response_bytes", 16 * 1024 * 1024)))
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise RuntimeError("upstream response too large")
+                    chunks.append(chunk)
+            raw = b"".join(chunks).decode("utf-8", errors="replace")
             return extract_response_text(raw)
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
+            if attempt < CONFIG["retry_attempts"] - 1 and _retryable(e):
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+                time.sleep(_retry_delay(attempt))
     raise last_err
 
 
@@ -377,42 +452,52 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
+    per_request_client = HAS_HTTPX and _RANDOM_TOKEN in (CONFIG.get("proxy") or "")
     client = _get_httpx_client()
 
     last_err = None
     emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                resp.raise_for_status()
-                buf = ""
-                for chunk in resp.iter_text():
-                    buf += chunk
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise UpstreamRejected(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        for t in _extract_texts_from_line(line):
-                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
-                                continue
-                            if not t.startswith(emitted_raw_text):
-                                raise UpstreamRejected("Gemini stream content changed during retry")
-                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
-                            emitted_raw_text = t
-                            if delta:
-                                yield delta
-            return
+            try:
+                with client.stream("POST", url, content=body, headers=headers) as resp:
+                    resp.raise_for_status()
+                    buf = ""
+                    total = 0
+                    limit = max(1, int(CONFIG.get("max_upstream_response_bytes", 16 * 1024 * 1024)))
+                    for chunk in resp.iter_text():
+                        total += len(chunk.encode("utf-8"))
+                        if total > limit:
+                            raise RuntimeError("upstream response too large")
+                        buf += chunk
+                        if "BardErrorInfo" in buf:
+                            bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                            if bard_err:
+                                raise UpstreamRejected(
+                                    f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                                )
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            for t in _extract_texts_from_line(line):
+                                if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                    continue
+                                if not t.startswith(emitted_raw_text):
+                                    raise UpstreamRejected("Gemini stream content changed during retry")
+                                delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                                emitted_raw_text = t
+                                if delta:
+                                    yield delta
+                return
+            finally:
+                if per_request_client:
+                    client.close()
         except UpstreamRejected:
             # Gemini rejected the request itself (BardErrorInfo); a retry with
             # the same payload cannot succeed.
             raise
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
+            if attempt < CONFIG["retry_attempts"] - 1 and _retryable(e):
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+                time.sleep(_retry_delay(attempt))
     raise last_err

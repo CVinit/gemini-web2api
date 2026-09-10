@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs
@@ -212,6 +213,45 @@ class StreamingEndpointTests(unittest.TestCase):
         headers = dict(response.getheaders())
         connection.close()
         return response.status, headers, body
+
+    def test_request_body_limit_returns_413(self):
+        CONFIG["max_request_body_bytes"] = 8
+
+        status, _, body = self.post_json(
+            "/v1/caches",
+            {"messages": [{"role": "user", "content": "too large"}]},
+        )
+
+        self.assertEqual(status, 413)
+        self.assertIn("request body too large", body)
+
+    def test_generation_concurrency_limit_returns_503(self):
+        CONFIG["max_inflight_requests"] = 1
+        CONFIG["inflight_acquire_timeout_sec"] = 0.05
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_generate(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=2)
+            return "ok"
+
+        def request():
+            return self.post_json(
+                "/v1/chat/completions",
+                {"model": "gemini-3.6-flash", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        with mock.patch("gemini_web2api.server.generate", side_effect=blocked_generate):
+            first = threading.Thread(target=request)
+            first.start()
+            self.assertTrue(started.wait(timeout=1))
+            second_status, _, second_body = request()
+            release.set()
+            first.join(timeout=2)
+
+        self.assertEqual(second_status, 503)
+        self.assertIn("server is busy", second_body)
 
     @mock.patch("gemini_web2api.server.generate_stream")
     def test_chat_stream_starts_with_assistant_role(self, generate_stream):

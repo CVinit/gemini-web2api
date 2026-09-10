@@ -6,4 +6,12 @@ services:
       - "8081:8081"
     volumes:
       - ./config.json:/app/config.json
+    # High-concurrency profile: allow many simultaneous connections/threads.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc: 4096
+    # Optional: avoid Docker NAT rejection from Gemini upstream (see README).
+    # network_mode: host
     restart: unless-stopped

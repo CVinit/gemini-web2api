@@ -1,5 +1,6 @@
 """HTTP server: OpenAI-compatible API endpoints."""
 import json
+import threading
 import time
 import uuid
 import re
@@ -13,6 +14,99 @@ from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prom
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .cache import CACHE
 from . import __version__
+
+
+class _CountingLimiter:
+    """Counting limiter with optional wait queue.
+
+    active  — slots currently held
+    waiting — threads blocked in acquire()
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active = 0
+        self._waiting = 0
+
+    @property
+    def active(self) -> int:
+        with self._condition:
+            return self._active
+
+    @property
+    def waiting(self) -> int:
+        with self._condition:
+            return self._waiting
+
+    def _max_active(self) -> int:
+        raise NotImplementedError
+
+    def _max_waiting(self) -> int:
+        return 0
+
+    def acquire(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._condition:
+            if self._active < self._max_active():
+                self._active += 1
+                return True
+            if self._waiting >= self._max_waiting():
+                return False
+            self._waiting += 1
+            try:
+                while self._active >= self._max_active():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+                self._active += 1
+                return True
+            finally:
+                self._waiting -= 1
+
+    def release(self):
+        with self._condition:
+            if self._active > 0:
+                self._active -= 1
+            self._condition.notify()
+
+
+class _GenerationLimiter(_CountingLimiter):
+    def _max_active(self) -> int:
+        return max(1, int(CONFIG.get("max_inflight_requests", 64)))
+
+    def _max_waiting(self) -> int:
+        return max(0, int(CONFIG.get("max_waiting_requests", 192)))
+
+
+class _ConnectionLimiter(_CountingLimiter):
+    def _max_active(self) -> int:
+        return max(1, int(CONFIG.get("max_concurrent_connections", 320)))
+
+
+_generation_limiter = _GenerationLimiter()
+_connection_limiter = _ConnectionLimiter()
+
+
+def _acquire_generation(handler) -> bool:
+    """Acquire a generation slot; on failure reply 503 with Retry-After."""
+    timeout = float(CONFIG.get("inflight_acquire_timeout_sec", 45.0))
+    if _generation_limiter.acquire(timeout):
+        return True
+    retry_after = max(1, int(timeout) or 1)
+    body = {"error": {"message": "server is busy", "type": "server_error"}}
+    raw = json.dumps(body).encode()
+    try:
+        handler.send_response(503)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Retry-After", str(retry_after))
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.end_headers()
+        handler.wfile.write(raw)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    return False
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -97,9 +191,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None
 
     def _read_request_body(self) -> bytes:
+        max_bytes = max(1, int(CONFIG.get("max_request_body_bytes", 4 * 1024 * 1024)))
         transfer_encoding = self.headers.get("Transfer-Encoding", "")
         if "chunked" in transfer_encoding.lower():
             chunks = []
+            total = 0
             while True:
                 size_line = self.rfile.readline()
                 if not size_line:
@@ -115,11 +211,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         if trailer in (b"\r\n", b"\n", b""):
                             break
                     break
+                if total + size > max_bytes:
+                    raise ValueError("request body too large")
                 chunks.append(self.rfile.read(size))
                 self.rfile.read(2)
+                total += size
             return b"".join(chunks)
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError as e:
+            raise ValueError("invalid Content-Length") from e
+        if length < 0 or length > max_bytes:
+            raise ValueError("request body too large")
         return self.rfile.read(length) if length else b""
 
     def _authorized(self):
@@ -174,8 +278,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 ]})
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+            elif self.path == "/metrics":
+                self.send_json({
+                    "inflight": _generation_limiter.active,
+                    "waiting": _generation_limiter.waiting,
+                    "connections": _connection_limiter.active,
+                    "max_inflight": int(CONFIG.get("max_inflight_requests", 64)),
+                    "max_waiting": int(CONFIG.get("max_waiting_requests", 192)),
+                    "max_connections": int(CONFIG.get("max_concurrent_connections", 320)),
+                })
             else:
                 self.send_json({"error": "not found"}, 404)
+        except ValueError as e:
+            status = 413 if str(e) == "request body too large" else 400
+            self.send_json({"error": {"message": str(e)}}, status)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -184,6 +300,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
+            self.connection.settimeout(float(CONFIG.get("request_body_timeout_sec", 30)))
             body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self._handle_chat(body)
@@ -199,11 +316,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except ValueError as e:
+            status = 413 if str(e) == "request body too large" else 400
+            self.send_json({"error": {"message": str(e)}}, status)
         except Exception as e:
             log(f"POST error: {e}")
             try:
                 self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+            except Exception:
                 pass
 
     def do_DELETE(self):
@@ -269,14 +389,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        try:
-            file_refs = _upload_images(images)
-        except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
 
         if stream and (not tools or tool_choice == "none"):
+            if not _acquire_generation(self):
+                return
             try:
+                try:
+                    file_refs = _upload_images(images)
+                except RuntimeError as e:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                    return
                 self._start_sse()
                 first_chunk = {
                     "id": cid,
@@ -315,13 +437,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Stream error: {e}")
+            finally:
+                _generation_limiter.release()
             return
 
+        if not _acquire_generation(self):
+            return
         try:
+            file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        finally:
+            _generation_limiter.release()
 
         tool_calls = None
         if tools and text and tool_choice != "none":
@@ -434,12 +563,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        if not _acquire_generation(self):
+            return
         try:
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        finally:
+            _generation_limiter.release()
 
         tool_calls = None
         if tools and text and tool_choice != "none":
@@ -621,15 +754,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
-        try:
-            file_refs = _upload_images(images)
-        except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
+            if not _acquire_generation(self):
+                return
             try:
+                try:
+                    file_refs = _upload_images(images)
+                except RuntimeError as e:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                    return
                 self._start_sse()
                 full_text = ""
                 for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
@@ -657,13 +792,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+            finally:
+                _generation_limiter.release()
             return
 
+        if not _acquire_generation(self):
+            return
         try:
+            file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
+        finally:
+            _generation_limiter.release()
 
         if not text:
             log("Warning: empty response from Gemini")
@@ -708,3 +850,39 @@ class GeminiHandler(BaseHTTPRequestHandler):
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
+
+    def __init__(self, *args, **kwargs):
+        backlog = int(CONFIG.get("http_listen_backlog", 128))
+        if backlog > 0:
+            self.request_queue_size = backlog
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        """Cap handler threads so a flood cannot exhaust the process."""
+        if not _connection_limiter.acquire(0.0):
+            body = b'{"error": {"message": "too many connections"}}'
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Retry-After: 1\r\n"
+                    b"Connection: close\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            _connection_limiter.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            _connection_limiter.release()

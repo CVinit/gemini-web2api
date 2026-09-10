@@ -8,6 +8,16 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
+    "max_request_body_bytes": 4 * 1024 * 1024,
+    "max_upstream_response_bytes": 16 * 1024 * 1024,
+    # High-concurrency profile (anonymous + per-request IP pool).
+    # Tuned for throughput over latency: requests queue instead of failing fast.
+    "max_inflight_requests": 64,
+    "max_waiting_requests": 192,
+    "inflight_acquire_timeout_sec": 45.0,
+    "max_concurrent_connections": 320,
+    "http_listen_backlog": 128,
+    "stream_flush_interval_bytes": 0,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,

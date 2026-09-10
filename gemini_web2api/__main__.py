@@ -39,6 +39,9 @@ def main():
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    print(f"  Inflight:  {CONFIG.get('max_inflight_requests')} active, "
+          f"{CONFIG.get('max_waiting_requests')} queued, "
+          f"{CONFIG.get('max_concurrent_connections')} connections")
     print()
     try:
         server.serve_forever()
