@@ -6,12 +6,19 @@ services:
       - "8081:8081"
     volumes:
       - ./config.json:/app/config.json
+      # Persist SQLite context cache (path from config: ./data/... → /app/data).
+      - gemini-web2api-cache:/app/data
     # High-concurrency profile: allow many simultaneous connections/threads.
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
       nproc: 4096
-    # Optional: avoid Docker NAT rejection from Gemini upstream (see README).
+    # Optional: avoid Docker NAT rejection from Gemini upstream when NOT using
+    # an external IP-pool proxy (direct egress). With proxy/{random} IP pool,
+    # Gemini sees the proxy exit IP, so bridge NAT is usually irrelevant.
     # network_mode: host
     restart: unless-stopped
+
+volumes:
+  gemini-web2api-cache:
